@@ -1,6 +1,7 @@
 
 */
 !py/
+benchmarks/.envrc
 !benchmarks/
 
 # golang binary
