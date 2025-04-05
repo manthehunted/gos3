@@ -9,6 +9,7 @@ import (
 	"iter"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,19 +21,35 @@ import (
 )
 
 const (
-	DEBUG   = slog.LevelDebug
-	INFO    = slog.LevelInfo
-	WARNING = slog.LevelWarn
-	ERROR   = slog.LevelError
+	DEBUG = slog.LevelDebug
+	INFO  = slog.LevelInfo
+	WARN  = slog.LevelWarn
+	ERROR = slog.LevelError
 )
 
 type Logger struct {
 	_logger slog.Logger
 }
 
-// FIXME: take level from env variables
+var LogLevel = os.Getenv("LOG_LEVEL")
+
 func NewLogger() Logger {
-	j := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: INFO}))
+	var level slog.Leveler
+	switch strings.ToLower(LogLevel) {
+	case "debug":
+		level = DEBUG
+	case "info":
+		level = INFO
+	case "warn":
+		level = WARN
+	case "error":
+		level = ERROR
+	case "":
+		level = INFO
+	default:
+		panic(fmt.Sprintf("LOG_LEVEL=%s not supported", LogLevel))
+	}
+	j := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	jj := Logger{_logger: *j}
 	return jj
 }
@@ -61,13 +78,81 @@ type Task struct {
 	LastModified *time.Time `json:"lastmodified"`
 }
 
-func (t *Task) String() string {
-	return fmt.Sprintf("%s||%s", *t.Bucket, *t.Key)
+func assert(s string) {
+	if strings.HasPrefix(s, "/") {
+		panic(s)
+	}
+}
+
+type Lister interface {
+	List(ctx context.Context, cfg *aws.Config, logger *Logger) iter.Seq[Task]
+}
+
+type S3Path struct{ path string }
+
+func NewS3Path(path string) (S3Path, error) {
+	if !strings.HasPrefix(path, "s3:/") {
+		return S3Path{}, errors.New(fmt.Sprintf("%s does not start with s3:/", path))
+	}
+	return S3Path{path}, nil
+}
+
+func (s3path *S3Path) ToBucketPrefix() (string, string) {
+	// NOTE: trim s3:/
+	str := s3path.path[4:]
+	// practice
+	defer func() {
+		if r := recover(); r != nil {
+			panic(fmt.Sprintf("%s starts with /", r))
+		}
+	}()
+	assert(str)
+
+	i := 0
+	lenPath := len(str)
+	for i < lenPath && !os.IsPathSeparator(str[i]) {
+		i++
+	}
+	return str[:i], str[i+1:]
+}
+
+func (s3path *S3Path) List(ctx context.Context, cfg *aws.Config, logger *Logger) iter.Seq[Task] {
+	bucket, prefix := s3path.ToBucketPrefix()
+	return ListObjects(ctx, cfg, &bucket, &prefix, logger)
+}
+
+type LocalFile struct{ path string }
+
+func (fs *LocalFile) List(ctx context.Context, cfg *aws.Config, logger *Logger) iter.Seq[Task] {
+	fd, err := os.Open(fs.path)
+	if err != nil {
+		panic(fmt.Sprintf("cannot read path=%s with error=%s", fs.path, err))
+	}
+	scanner := bufio.NewScanner(fd)
+	return func(yield func(d Task) bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Warn(fmt.Sprint(r))
+			}
+		}()
+		for scanner.Scan() {
+			s3path, err := NewS3Path(scanner.Text())
+			if err != nil {
+				logger.Warn(err.Error())
+				continue
+			}
+			bucket, prefix := s3path.ToBucketPrefix()
+			for k := range ListObjects(ctx, cfg, &bucket, &prefix, logger) {
+				if !yield(k) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // ListObjects lists the objects in a bucket.
 func ListObjects(ctx context.Context, cfg *aws.Config, bucket *string, prefix *string, logger *Logger) iter.Seq[Task] {
-
 	return func(yield func(d Task) bool) {
 		var err error
 		var output *s3.ListObjectsV2Output
@@ -86,6 +171,8 @@ func ListObjects(ctx context.Context, cfg *aws.Config, bucket *string, prefix *s
 				if errors.As(err, &noBucket) {
 					logger.Warn(fmt.Sprintf("Bucket %s does not exist.\n", *bucket))
 					err = noBucket
+				} else {
+					logger.Warn(fmt.Sprintf("got err while pagination=%s\n", err))
 				}
 				break
 			} else {
@@ -100,11 +187,7 @@ func ListObjects(ctx context.Context, cfg *aws.Config, bucket *string, prefix *s
 	}
 }
 
-var wg sync.WaitGroup
-
-type Path = string
-
-func save(readClose io.ReadCloser, fs string) (Path, error) {
+func save(readClose io.ReadCloser, fs string) (string, error) {
 	f, err := os.Create(fs)
 	defer f.Close()
 	defer readClose.Close()
@@ -176,21 +259,37 @@ func processData(wg *sync.WaitGroup, task Task, cfg *aws.Config, logger *Logger)
 }
 
 func main() {
-	bucket := aws.String(os.Args[1])
-	prefix := aws.String(os.Args[2])
-
+	// Support
+	// s3 s3:/test/prefix
+	// s3 s3:/test/prefix/t.go
+	// s3 file.txt
+	// where file.txt is \n separated
+	// contains s3 path
 	logger := NewLogger()
+
+	var ls Lister
+	filename := filepath.Clean(os.Args[1])
+	if strings.HasPrefix(filename, "s3:/") {
+		ls = &S3Path{filename}
+	} else if strings.HasSuffix(filename, ".txt") {
+		filepath.IsLocal(filename)
+		ls = &LocalFile{filename}
+	} else {
+		panic("only support file extension is .txt or string starts with s3:/")
+	}
+
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		logger.Fatalln(err.Error())
 	}
 
+	var wg sync.WaitGroup
 	ctx := context.Background()
-	for task := range ListObjects(ctx, &cfg, bucket, prefix, &logger) {
+	for task := range ls.List(ctx, &cfg, &logger) {
 		wg.Add(1)
 		go processData(&wg, task, &cfg, &logger)
 	}
-	logger.Println("done sending")
+	logger.Println("done")
 
 	wg.Wait()
 }
