@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"iter"
@@ -91,15 +92,15 @@ type Lister interface {
 type S3Path struct{ path string }
 
 func NewS3Path(path string) (S3Path, error) {
-	if !strings.HasPrefix(path, "s3:/") {
-		return S3Path{}, errors.New(fmt.Sprintf("%s does not start with s3:/", path))
+	if !strings.HasPrefix(path, "s3://") {
+		return S3Path{}, errors.New(fmt.Sprintf("%s does not start with s3://", path))
 	}
 	return S3Path{path}, nil
 }
 
 func (s3path *S3Path) ToBucketPrefix() (string, string) {
-	// NOTE: trim s3:/
-	str := s3path.path[4:]
+	// NOTE: trim s3://
+	str := s3path.path[5:]
 	// practice
 	defer func() {
 		if r := recover(); r != nil {
@@ -258,24 +259,97 @@ func processData(wg *sync.WaitGroup, task Task, cfg *aws.Config, logger *Logger)
 	}
 }
 
+type Time struct{ time time.Time }
+
+func (t *Time) String() string {
+	return t.time.String()
+}
+
+const shortForm = "2006-01-02"
+
+func (t *Time) Set(value string) error {
+	parsed, err1 := time.Parse(shortForm, value)
+	if err1 == nil {
+		*t = Time{time: parsed}
+		return nil
+	}
+	parsed, err2 := time.Parse(time.RFC3339, value)
+	if err2 == nil {
+		*t = Time{time: parsed}
+		return nil
+	}
+	return errors.New(fmt.Sprintf("%s, %s", err1.Error(), err2.Error()))
+}
+
+var dmin Time
+var dmax Time
+
+func filter(min Time, max Time) func(t Task) bool {
+	switch true {
+	case (min != Time{}) && (max == (Time{})):
+		return func(t Task) bool {
+			if t.LastModified != nil {
+				tlm := *t.LastModified
+				tt := min.time
+				a := (tlm.Compare(tt) >= 0)
+				return a
+			} else {
+				return false
+			}
+		}
+	case (min == Time{}) && (max != Time{}):
+		return func(t Task) bool {
+			if t.LastModified != nil {
+				tlm := *t.LastModified
+				tt := max.time
+				a := (tlm.Compare(tt) <= 0)
+				return a
+			} else {
+				return false
+			}
+		}
+	case (min != Time{}) && (max != Time{}):
+		return func(t Task) bool {
+			if t.LastModified != nil {
+				tlm := *t.LastModified
+				tmax := max.time
+				tmin := min.time
+				a := tlm.Compare(tmin) >= 0
+				b := tlm.Compare(tmax) <= 0
+				return a && b
+			} else {
+				return false
+			}
+		}
+	default:
+		return func(t Task) bool { return true }
+	}
+}
+
 func main() {
 	// Support
-	// s3 s3:/test/prefix
-	// s3 s3:/test/prefix/t.go
+	// s3 s3://test/prefix
+	// s3 s3://test/prefix/t.go
 	// s3 file.txt
-	// where file.txt is \n separated
-	// contains s3 path
+	//   where file.txt is \n separated
+	//   contains s3 path
 	logger := NewLogger()
 
+	var path = flag.String("path", "", "S3 path or local fs path to download from")
+	flag.Var(&dmin, "mindate", "filter S3 files older than the specified date")
+	flag.Var(&dmax, "maxdate", "filter S3 files newer than the specified date")
+	flag.Parse()
+	filt := filter(dmin, dmax)
+
 	var ls Lister
-	filename := filepath.Clean(os.Args[1])
-	if strings.HasPrefix(filename, "s3:/") {
+	filename := filepath.Clean(*path)
+	if strings.HasPrefix(filename, "s3://") {
 		ls = &S3Path{filename}
 	} else if strings.HasSuffix(filename, ".txt") {
 		filepath.IsLocal(filename)
 		ls = &LocalFile{filename}
 	} else {
-		panic("only support file extension is .txt or string starts with s3:/")
+		panic("only support file extension is .txt or string starts with s3://")
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
@@ -286,8 +360,10 @@ func main() {
 	var wg sync.WaitGroup
 	ctx := context.Background()
 	for task := range ls.List(ctx, &cfg, &logger) {
-		wg.Add(1)
-		go processData(&wg, task, &cfg, &logger)
+		if filt(task) {
+			wg.Add(1)
+			go processData(&wg, task, &cfg, &logger)
+		}
 	}
 	logger.Println("done")
 
